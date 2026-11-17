@@ -1,16 +1,26 @@
-// A Telegram bot you can deploy in one click and then make your own.
-//
-// Two ways to receive updates:
-//   polling (default): the bot asks Telegram for updates. Works everywhere,
-//     needs no web address, fine for almost every bot.
-//   webhook: Telegram pushes updates to https://<your app>/telegram. Set
-//     TELEGRAM_MODE=webhook and WEBHOOK_URL to the app's public address.
-//
-// Handlers live in src/commands.js. This file only wires things up.
 
-import http from "node:http"
-import { Bot, webhookCallback } from "grammy"
-import { registerCommands } from "./src/commands.js"
+/**
+ * GOLD TRADING TELEGRAM BOT
+ *
+ * Description:
+ * Telegram bot for market analysis and trading alerts.
+ *
+ * Connection:
+ * Polling mode (no webhook required).
+ *
+ * Market data:
+ * Deriv API.
+ *
+ * Commands:
+ * Stored in src/commands.js
+ *
+ * Market analysis:
+ * Stored in src/market.js
+ */
+
+import http from "node:http";
+import { Bot } from "grammy";
+import { registerCommands } from "./src/commands.js";
 
 const token = process.env.TELEGRAM_BOT_TOKEN
 if (!token) {
