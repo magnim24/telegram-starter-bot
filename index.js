@@ -12,131 +12,472 @@ import http from "node:http"
 import { Bot, webhookCallback } from "grammy"
 import { registerCommands } from "./src/commands.js"
 
-const token = process.env.TELEGRAM_BOT_TOKEN
-if (!token) {
-  console.error("TELEGRAM_BOT_TOKEN is missing. Open Telegram, talk to @BotFather, send /newbot, and set the token it gives you as an environment variable.")
-  process.exit(1)
+const TelegramBot = require("node-telegram-bot-api");
+const WebSocket = require("ws");
+
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+if (!TOKEN) {
+  throw new Error("Set TELEGRAM_BOT_TOKEN in FadeHost environment variables.");
 }
 
-const mode = (process.env.TELEGRAM_MODE || "polling").trim().toLowerCase()
-const bot = new Bot(token)
+const DERIV_URL =
+  "wss://api.derivws.com/trading/v1/options/ws/public";
 
-registerCommands(bot)
+const bot = new TelegramBot(TOKEN, { polling: true });
 
-bot.catch((err) => {
-  console.error("[bot] error while handling an update:", err.error ?? err)
-})
+let socket = null;
+let connecting = null;
+let requestId = 0;
 
-function explain(err) {
-  const code = err?.error_code ?? err?.response?.error_code
-  if (code === 401) {
-    console.error("Telegram rejected the token (401 Unauthorized). Copy it again from @BotFather; a revoked token stops working at once.")
-  } else if (code === 404) {
-    console.error("Telegram answered 404: the token is not a bot token. It looks like 123456789:AAF... and comes from @BotFather.")
-  } else {
-    console.error("[bot] could not reach Telegram:", err?.message ?? err)
+const pending = new Map();
+const watched = new Map();
+const automaticChats = new Set();
+const lastSignals = new Map();
+
+function connectDeriv() {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    return Promise.resolve();
   }
-}
 
-async function main() {
-  let me
-  try {
-    me = await bot.api.getMe()
-  } catch (err) {
-    explain(err)
-    process.exit(1)
-  }
-  console.log(`[bot] logged in as @${me.username} (${mode} mode)`)
+  if (connecting) return connecting;
 
-  if (mode === "webhook") {
-    const url = (process.env.WEBHOOK_URL || "").trim().replace(/\/$/, "")
-    if (!url.startsWith("https://")) {
-      console.error("WEBHOOK_URL is missing or not https. Set it to the app's public address, for example https://my-bot.fadehost.app")
-      process.exit(1)
-    }
-    const secret = (process.env.WEBHOOK_SECRET || "").trim() || undefined
-    const port = Number(process.env.PORT || 3000)
-    const handle = webhookCallback(bot, "http", { secretToken: secret })
+  connecting = new Promise((resolve, reject) => {
+    const ws = new WebSocket(DERIV_URL);
+    socket = ws;
 
-    http
-      .createServer((req, res) => {
-        if (req.method === "POST" && req.url === "/telegram") return handle(req, res)
-        if (req.method === "GET" && req.url === "/") {
-          res.writeHead(200, { "content-type": "text/plain" })
-          return res.end(`@${me.username} is running`)
+    const timeout = setTimeout(() => {
+      ws.terminate();
+      reject(new Error("Deriv connection timed out."));
+    }, 15000);
+
+    ws.on("open", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+
+    ws.on("message", raw => {
+      let data;
+
+      try {
+        data = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      if (data.req_id && pending.has(data.req_id)) {
+        const item = pending.get(data.req_id);
+        pending.delete(data.req_id);
+
+        if (data.error) {
+          item.reject(new Error(data.error.message));
+        } else {
+          item.resolve(data);
         }
-        res.writeHead(404)
-        res.end()
-      })
-      .listen(port, () => console.log(`[bot] webhook server listening on port ${port}`))
+      }
+    });
 
-    await bot.api.setWebhook(`${url}/telegram`, { secret_token: secret })
-    console.log(`[bot] webhook set to ${url}/telegram`)
-    return
+    ws.on("error", error => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+
+    ws.on("close", () => {
+      clearTimeout(timeout);
+      if (socket === ws) socket = null;
+
+      pending.forEach(item =>
+        item.reject(new Error("Deriv connection closed."))
+      );
+
+      pending.clear();
+    });
+  }).finally(() => {
+    connecting = null;
+  });
+
+  return connecting;
+}
+
+async function derivRequest(payload) {
+  await connectDeriv();
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    throw new Error("Deriv is not connected.");
   }
 
-  // Polling: make sure no webhook is left over from an earlier webhook run.
-  await bot.api.deleteWebhook().catch(() => {})
+  const id = ++requestId;
 
-  // Telegram gives a bot's updates to one poller at a time. When the same
-  // token is already running somewhere else (your own computer, another
-  // host, a second copy of this app), Telegram answers 409 and this copy
-  // loses. It does not crash over that: it waits, asks again less and less
-  // often, and takes over by itself once the other copy has stopped.
-  let wait = 20
-  let waitingForOther = false
-  for (;;) {
-    const began = Date.now()
-    let settled
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error("Deriv request timed out."));
+    }, 20000);
+
+    pending.set(id, {
+      resolve: result => {
+        clearTimeout(timeout);
+        resolve(result);
+      },
+      reject: error => {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+
+    socket.send(JSON.stringify({
+      ...payload,
+      req_id: id
+    }), error => {
+      if (error) {
+        clearTimeout(timeout);
+        pending.delete(id);
+        reject(error);
+      }
+    });
+  });
+}
+
+async function getMarkets() {
+  const result = await derivRequest({
+    active_symbols: "brief"
+  });
+
+  return result.active_symbols || [];
+}
+
+async function getCandles(symbol, timeframe) {
+  const result = await derivRequest({
+    ticks_history: symbol,
+    count: 220,
+    end: "latest",
+    style: "candles",
+    granularity: timeframe
+  });
+
+  if (!result.candles || result.candles.length < 202) {
+    throw new Error("Insufficient candle history.");
+  }
+
+  // Exclude the unfinished candle.
+  return result.candles.slice(0, -1).map(c => ({
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close)
+  }));
+}
+
+function calculateEMA(values, period) {
+  const multiplier = 2 / (period + 1);
+  let result = values[0];
+
+  for (let i = 1; i < values.length; i++) {
+    result =
+      values[i] * multiplier +
+      result * (1 - multiplier);
+  }
+
+  return result;
+}
+
+function calculateATR(candles, period = 14) {
+  const ranges = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
+
+    ranges.push(Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    ));
+  }
+
+  const recent = ranges.slice(-period);
+
+  return recent.reduce((a, b) => a + b, 0) /
+    recent.length;
+}
+
+function analyse(candles) {
+  const closes = candles.map(c => c.close);
+  const last = candles[candles.length - 1];
+  const previous = candles[candles.length - 2];
+
+  const ema50 = calculateEMA(closes, 50);
+  const ema200 = calculateEMA(closes, 200);
+  const atr = calculateATR(candles);
+
+  return {
+    price: last.close,
+    ema50,
+    ema200,
+    atr,
+
+    bullish: ema50 > ema200 && last.close > ema50,
+    bearish: ema50 < ema200 && last.close < ema50,
+
+    breakoutUp: last.close > previous.high,
+    breakoutDown: last.close < previous.low
+  };
+}
+
+function formatPrice(value) {
+  return Number(value.toPrecision(8)).toString();
+}
+
+async function analyseMarket(symbol) {
+  const [h1, m15, m5] = await Promise.all([
+    getCandles(symbol, 3600),
+    getCandles(symbol, 900),
+    getCandles(symbol, 300)
+  ]);
+
+  const H1 = analyse(h1);
+  const M15 = analyse(m15);
+  const M5 = analyse(m5);
+
+  let direction = "NO TRADE";
+
+  if (
+    H1.bullish &&
+    M15.bullish &&
+    M5.bullish &&
+    M5.breakoutUp
+  ) {
+    direction = "BUY";
+  }
+
+  if (
+    H1.bearish &&
+    M15.bearish &&
+    M5.bearish &&
+    M5.breakoutDown
+  ) {
+    direction = "SELL";
+  }
+
+  if (direction === "NO TRADE") {
+    return {
+      direction,
+      message:
+        `MAGNIM MARKET ANALYSIS\n\n` +
+        `Market: ${symbol}\n` +
+        `H1: ${H1.bullish ? "Bullish" : H1.bearish ? "Bearish" : "Mixed"}\n` +
+        `M15: ${M15.bullish ? "Bullish" : M15.bearish ? "Bearish" : "Mixed"}\n` +
+        `M5: Waiting for breakout confirmation\n` +
+        `Current reference: ${formatPrice(M5.price)}\n\n` +
+        `Decision: NO TRADE\n` +
+        `Waiting for confirmation.`
+    };
+  }
+
+  const entry = M5.price;
+  const risk = M5.atr * 1.5;
+
+  const sl = direction === "BUY"
+    ? entry - risk
+    : entry + risk;
+
+  const targets = [1, 2, 3].map(multiplier =>
+    direction === "BUY"
+      ? entry + risk * multiplier
+      : entry - risk * multiplier
+  );
+
+  return {
+    direction,
+    message: [
+      "MAGNIM TRADING SIGNAL",
+      "",
+      `Market: ${symbol}`,
+      `Direction: ${direction}`,
+      "Timeframes: H1 / M15 / M5",
+      "",
+      `Entry reference: ${formatPrice(entry)}`,
+      `Stop Loss: ${formatPrice(sl)}`,
+      `TP1: ${formatPrice(targets[0])}`,
+      `TP2: ${formatPrice(targets[1])}`,
+      `TP3: ${formatPrice(targets[2])}`,
+      "",
+      "Risk-to-reward: 1:1 / 1:2 / 1:3",
+      "Confirmation: EMA alignment and breakout",
+      "Status: Preliminary signal",
+      "",
+      "Source: Deriv public market data",
+      "Risk warning: No guaranteed profits."
+    ].join("\n")
+  };
+}
+
+async function scanChat(chatId) {
+  const symbols = watched.get(chatId) || [];
+
+  if (!symbols.length) {
+    return bot.sendMessage(
+      chatId,
+      "No markets selected.\nUse /markets and /watch SYMBOL first."
+    );
+  }
+
+  for (const symbol of symbols) {
     try {
-      await bot.start({
-        onStart: () => {
-          if (!waitingForOther) {
-            console.log("[bot] polling for updates")
-            return
-          }
-          // The library reports a start before the first poll is answered,
-          // so only a poll that survives a while means the other copy is gone.
-          settled = setTimeout(() => {
-            waitingForOther = false
-            wait = 20
-            console.log("[bot] the other copy has stopped, this one is receiving updates now")
-          }, 45_000)
-        },
-      })
-      return
-    } catch (err) {
-      clearTimeout(settled)
-      const code = err?.error_code ?? err?.response?.error_code
-      if (code === 401 || code === 404) {
-        explain(err)
-        process.exit(1)
+      const result = await analyseMarket(symbol);
+
+      const key = `${chatId}:${symbol}`;
+      const previous = lastSignals.get(key);
+
+      // Avoid repeatedly sending identical decisions.
+      if (
+        result.direction !== "NO TRADE" &&
+        result.direction === previous
+      ) {
+        continue;
       }
-      // It had been running fine for a while: this is a new episode.
-      if (Date.now() - began > 120_000) {
-        wait = 20
-        waitingForOther = false
-      }
-      if (code === 409) {
-        if (!waitingForOther) {
-          console.error("[bot] another copy of this bot is running with the same token, and Telegram allows one at a time. Stop the other copy and this one takes over by itself. Nothing else needs to change here.")
-          waitingForOther = true
-        }
-      } else {
-        console.error("[bot] polling stopped:", err?.message ?? err)
-      }
-      console.error(`[bot] trying again in ${wait} seconds`)
-      await new Promise((resolve) => setTimeout(resolve, wait * 1000))
-      wait = Math.min(wait * 2, 300)
+
+      lastSignals.set(key, result.direction);
+
+      await bot.sendMessage(chatId, result.message);
+
+    } catch (error) {
+      await bot.sendMessage(
+        chatId,
+        `${symbol}: Data unavailable. ${error.message}`
+      );
     }
   }
 }
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.once(signal, () => {
-    console.log(`[bot] ${signal}, stopping`)
-    bot.stop().finally(() => process.exit(0))
-  })
-}
+bot.onText(/^\/start$/, async msg => {
+  bot.sendMessage(
+    msg.chat.id,
+    "Welcome to MAGNIM TRADING BOT!\n\n" +
+    "Deriv market analysis assistant.\n\n" +
+    "/help - Commands\n" +
+    "/markets - Available markets\n" +
+    "/watch SYMBOL - Select market\n" +
+    "/scan - Scan selected markets\n" +
+    "/auto - Enable automatic scanning\n" +
+    "/stop - Stop automatic scanning"
+  );
+});
 
-main()
+bot.onText(/^\/help$/, msg => {
+  bot.sendMessage(
+    msg.chat.id,
+    "MAGNIM COMMANDS\n\n" +
+    "/markets\n" +
+    "/watch SYMBOL\n" +
+    "/scan\n" +
+    "/auto\n" +
+    "/stop\n\n" +
+    "This version generates analysis only. " +
+    "It does not execute trades."
+  );
+});
+
+bot.onText(/^\/markets$/, async msg => {
+  try {
+    const symbols = await getMarkets();
+
+    const matching = symbols.filter(item =>
+      /gold|bitcoin|boom|crash|volatility|EUR|GBP|USD/i
+        .test(item.display_name || "")
+    );
+
+    const output = matching.slice(0, 50).map(item =>
+      `${item.display_name}: ${item.symbol}`
+    );
+
+    await bot.sendMessage(
+      msg.chat.id,
+      output.length
+        ? output.join("\n")
+        : "No matching markets found."
+    );
+
+  } catch (error) {
+    bot.sendMessage(msg.chat.id, error.message);
+  }
+});
+
+bot.onText(/^\/watch\s+([A-Za-z0-9_]+)$/, async (msg, match) => {
+  const symbol = match[1].toUpperCase();
+
+  try {
+    const markets = await getMarkets();
+
+    const found = markets.find(item =>
+      item.symbol.toUpperCase() === symbol
+    );
+
+    if (!found) {
+      return bot.sendMessage(
+        msg.chat.id,
+        "Symbol not found. Use /markets to check available symbols."
+      );
+    }
+
+    const list = watched.get(msg.chat.id) || [];
+
+    if (!list.includes(symbol)) list.push(symbol);
+
+    watched.set(msg.chat.id, list);
+
+    bot.sendMessage(
+      msg.chat.id,
+      `Market added: ${found.display_name}\nSymbol: ${symbol}`
+    );
+
+  } catch (error) {
+    bot.sendMessage(msg.chat.id, error.message);
+  }
+});
+
+bot.onText(/^\/scan$/, msg => {
+  scanChat(msg.chat.id);
+});
+
+bot.onText(/^\/auto$/, msg => {
+  automaticChats.add(msg.chat.id);
+
+  bot.sendMessage(
+    msg.chat.id,
+    "Automatic scanning enabled. " +
+    "The bot will check your selected markets every five minutes."
+  );
+});
+
+bot.onText(/^\/stop$/, msg => {
+  automaticChats.delete(msg.chat.id);
+
+  bot.sendMessage(
+    msg.chat.id,
+    "Automatic scanning stopped."
+  );
+});
+
+// Automatic scanning for each Telegram chat.
+let scanning = false;
+
+setInterval(async () => {
+  if (scanning || automaticChats.size === 0) return;
+
+  scanning = true;
+
+  try {
+    for (const chatId of automaticChats) {
+      await scanChat(chatId);
+    }
+  } finally {
+    scanning = false;
+  }
+}, 300000);
+
+bot.on("polling_error", error => {
+  console.error("Telegram error:", error.message);
+});
+
+console.log("Magnim Trading Bot is starting.");
